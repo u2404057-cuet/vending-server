@@ -722,6 +722,14 @@ app.get("/", (req, res) => {
   res.send("SERVER created");
 });
 
-app.listen(port, () => {
-  console.log(`server running at port: ${port}`);
-});
+// Only actually binds to a port for local dev (`node index.js` /
+// `nodemon index.js`). On Vercel, the exported `app` below is what gets
+// used directly as a serverless request handler — this listen() call
+// simply never gets reached in that environment.
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`server running at port: ${port}`);
+  });
+}
+
+export default app;
