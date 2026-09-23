@@ -69,8 +69,59 @@ const userCollection = client.db("dispo").collection("user");
 const sessionCollection = client.db("dispo").collection("session");
 const accountCollection = client.db("dispo").collection("account");
 const ordersCollection = client.db("dispo").collection("orders");
+const deviceLogsCollection = client.db("dispo").collection("device_logs");
 const ALLOWED_ROLES = ["customer", "owner", "admin"];
 const ALLOWED_DEVICE_TYPES = ["coffee_machine", "vending_machine", "juice_machine"];
+
+// An order stuck this long without the board confirming completion is
+// treated as failed — either the machine never picked it up (still
+// "pending") or it grabbed the order and never came back ("dispensing":
+// jam, crash, power loss). Checked lazily on read (see expireStaleOrders)
+// rather than a background cron job, since Vercel serverless has nowhere
+// to run one.
+const STALE_ORDER_MS = 5 * 60 * 1000;
+
+// Flips an order to "failed" and restores stock for whatever wasn't
+// dispensed yet. `stockRestored` makes this idempotent — safe to call on
+// the same order twice (e.g. the lazy sweep and an explicit /fail call
+// racing each other) without crediting stock back more than once.
+async function failOrderInternal(order, reason) {
+  if (!order.stockRestored) {
+    for (const item of order.items) {
+      const remaining = item.qty - (item.dispensedQty || 0);
+      if (remaining > 0) {
+        await productsCollection.updateOne(
+          { deviceId: order.deviceId, slotNumber: item.slotNumber },
+          { $inc: { stock: remaining } }
+        );
+      }
+    }
+  }
+  await ordersCollection.updateOne(
+    { _id: order._id },
+    { $set: { status: "failed", failedAt: new Date(), failureReason: reason, stockRestored: true } }
+  );
+}
+
+// Called at the top of every order-reading route, scoped to whatever that
+// route is already filtering by, so stale orders self-heal the moment
+// anyone looks rather than needing a scheduled job.
+async function expireStaleOrders(extraFilter = {}) {
+  const cutoff = new Date(Date.now() - STALE_ORDER_MS);
+  const staleOrders = await ordersCollection
+    .find({
+      ...extraFilter,
+      $or: [
+        { status: "pending", createdAt: { $lt: cutoff } },
+        { status: "dispensing", dispensingStartedAt: { $lt: cutoff } },
+      ],
+    })
+    .toArray();
+
+  for (const order of staleOrders) {
+    await failOrderInternal(order, "timeout");
+  }
+}
 
 // ── Users (admin only) ─────────────────────────────────
 app.get("/api/users", requireAuth, requireRole(["admin"]), async (req, res) => {
@@ -401,6 +452,218 @@ app.patch("/api/devices/:id/wifi-status", requireAuth, requireRole(["owner", "ad
   }
 });
 
+// ── Device-facing endpoints ───────────────────────────────────────
+// Called directly by the ESP32 firmware itself, not by a logged-in user —
+// there's no session/cookie to check here. Instead, the device proves it's
+// legitimate simply by knowing its own qrToken, matching the same
+// principle as the existing public by-token lookup above. This is a
+// deliberate, pragmatic tradeoff for this project's scope: a real
+// production system would likely use a dedicated device credential
+// instead of reusing the QR token, but the QR token being printed on a
+// physical sticker (rather than transmitted over the open internet
+// unprompted) makes this a reasonable risk level here.
+
+// Polled by the board every few seconds. Returns the single oldest
+// pending order for this device, or {} if there's nothing to dispense —
+// deliberately one order at a time rather than a full queue, so the
+// firmware only ever has to think about one dispense sequence at once.
+// Claims the order (→ "dispensing") in the same request it's handed out,
+// so a board that grabs an order and then goes dark is distinguishable
+// (stuck "dispensing") from one that's simply offline (order stays
+// "pending" and nobody has claimed it).
+app.get("/api/devices/by-token/:token/pending-orders", async (req, res) => {
+  try {
+    const device = await devicesCollection.findOne({ qrToken: req.params.token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await expireStaleOrders({ deviceId: device._id.toString() });
+
+    const order = await ordersCollection.findOne(
+      { deviceId: device._id.toString(), status: "pending" },
+      { sort: { createdAt: 1 } }
+    );
+    if (!order) return res.json({});
+
+    await ordersCollection.updateOne(
+      { _id: order._id },
+      { $set: { status: "dispensing", dispensingStartedAt: new Date() } }
+    );
+
+    res.json({
+      orderId: order._id.toString(),
+      items: order.items.map((item) => ({ slotNumber: item.slotNumber, qty: item.qty })),
+    });
+  } catch (error) {
+    console.error("Error fetching pending orders for device:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Called by the board after each individual unit it dispenses (not just
+// once at the end) — this is what lets /fail restore only the portion
+// that never actually left the machine, rather than the whole order.
+// Capped at the ordered qty so a retried/duplicate call can't inflate it
+// past what was really ordered.
+app.patch("/api/devices/by-token/:token/orders/:orderId/items/:slotNumber/progress", async (req, res) => {
+  try {
+    const device = await devicesCollection.findOne({ qrToken: req.params.token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.orderId) });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.deviceId !== device._id.toString()) {
+      return res.status(403).json({ error: "That order doesn't belong to this device" });
+    }
+
+    const slotNumber = Number(req.params.slotNumber);
+    const itemIndex = order.items.findIndex((item) => item.slotNumber === slotNumber);
+    if (itemIndex === -1) {
+      return res.status(400).json({ error: "That slot isn't part of this order" });
+    }
+
+    const item = order.items[itemIndex];
+    const dispensedQty = item.dispensedQty || 0;
+    if (dispensedQty >= item.qty) {
+      return res.json({ success: true, dispensedQty }); // already fully reported — no-op
+    }
+
+    const updatedQty = dispensedQty + 1;
+    await ordersCollection.updateOne(
+      { _id: order._id },
+      { $set: { [`items.${itemIndex}.dispensedQty`]: updatedQty } }
+    );
+    res.json({ success: true, dispensedQty: updatedQty });
+  } catch (error) {
+    console.error("Error recording dispense progress:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Called by the board once it's physically finished dispensing every item
+// in an order. Verifies the order genuinely belongs to the device behind
+// this token before completing it, so one board can't mark another
+// device's orders complete even if it somehow guessed an order ID. Forces
+// every item's dispensedQty to its full qty as a safety net, in case a
+// /progress call was ever dropped along the way.
+app.patch("/api/devices/by-token/:token/orders/:orderId/complete", async (req, res) => {
+  try {
+    const device = await devicesCollection.findOne({ qrToken: req.params.token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.orderId) });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.deviceId !== device._id.toString()) {
+      return res.status(403).json({ error: "That order doesn't belong to this device" });
+    }
+    if (order.status === "completed") {
+      return res.json({ success: true }); // already done — treat as success, not an error
+    }
+    if (order.status === "failed") {
+      return res.status(400).json({ error: "This order already timed out and had its stock restored." });
+    }
+
+    const fullyDispensedItems = order.items.map((item, i) => ({
+      [`items.${i}.dispensedQty`]: item.qty,
+    }));
+    const dispensedFieldsSet = Object.assign({}, ...fullyDispensedItems);
+
+    await ordersCollection.updateOne(
+      { _id: order._id },
+      { $set: { ...dispensedFieldsSet, status: "completed", completedAt: new Date() } }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error completing order from device:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Lets the board explicitly report "I couldn't finish this" (jam, sensor
+// fault, out of stock in the physical hopper, etc.) instead of just going
+// quiet and waiting for the timeout sweep to notice. Restores stock for
+// whatever wasn't dispensed, same as the timeout path.
+app.patch("/api/devices/by-token/:token/orders/:orderId/fail", async (req, res) => {
+  try {
+    const device = await devicesCollection.findOne({ qrToken: req.params.token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.orderId) });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.deviceId !== device._id.toString()) {
+      return res.status(403).json({ error: "That order doesn't belong to this device" });
+    }
+    if (order.status === "completed" || order.status === "failed") {
+      return res.json({ success: true }); // already resolved — treat as success
+    }
+
+    const reason = (req.body && req.body.reason) || "device_reported_failure";
+    await failOrderInternal(order, reason);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error failing order from device:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Heartbeat, sent every ~30s by the firmware. Records the latest snapshot
+// directly on the device document — this is "what's true right now", not
+// a history, so it overwrites rather than appending.
+app.post("/telemetry", async (req, res) => {
+  try {
+    const { deviceId: token, ip, rssi, freeHeap, uptimeSeconds } = req.body || {};
+    if (!token) return res.status(400).json({ error: "Validation Error: 'deviceId' is required" });
+
+    const device = await devicesCollection.findOne({ qrToken: token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await devicesCollection.updateOne(
+      { _id: device._id },
+      {
+        $set: {
+          lastKnownIp: ip,
+          lastTelemetryAt: new Date(),
+          lastRssi: rssi,
+          lastFreeHeap: freeHeap,
+          lastUptimeSeconds: uptimeSeconds,
+        },
+      }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error recording telemetry:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Dispense-completion log, sent once per physical dispense. Kept as its
+// own append-only collection (unlike telemetry) since this is a real
+// history worth preserving, not just a "latest state" snapshot.
+app.post("/logs", async (req, res) => {
+  try {
+    const { deviceId: token, slotNumber, status, timestamp, rssi } = req.body || {};
+    if (!token) return res.status(400).json({ error: "Validation Error: 'deviceId' is required" });
+
+    const device = await devicesCollection.findOne({ qrToken: token });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    await deviceLogsCollection.insertOne({
+      deviceId: device._id.toString(),
+      slotNumber,
+      status: status || "UNKNOWN",
+      rssi,
+      // Firmware sends epoch seconds (0 if NTP hasn't synced yet) — fall
+      // back to server time when that happens, so the log entry still has
+      // a sensible date rather than the 1970 epoch.
+      deviceTimestamp: timestamp || null,
+      createdAt: new Date(),
+    });
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error recording device log:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ── Products ─────────────────────────────────────────────────────
 // Requires login (any role) — matches src/proxy.js on the Next.js side,
 // which already gates every /shop/* page behind a session. Without
@@ -640,6 +903,7 @@ app.post("/api/orders", requireAuth, async (req, res) => {
         name: product.name, // locked in at time of purchase
         price: product.price, // locked in at time of purchase
         qty: requested.qty,
+        dispensedQty: 0,
       });
     }
 
@@ -658,9 +922,16 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       deviceId,
       items: orderItems,
       total,
-      status: "pending", // becomes "completed" once the machine confirms dispensing
+      // pending -> dispensing (a board claimed it) -> completed, or ->
+      // failed (timed out or the board explicitly gave up; see
+      // expireStaleOrders / the device-facing /fail route).
+      status: "pending",
       createdAt: new Date(),
+      dispensingStartedAt: null,
       completedAt: null,
+      failedAt: null,
+      failureReason: null,
+      stockRestored: false,
     };
     const result = await ordersCollection.insertOne(newOrder);
 
@@ -674,13 +945,37 @@ app.post("/api/orders", requireAuth, async (req, res) => {
 // Current customer's own order history
 app.get("/api/orders/mine", requireAuth, async (req, res) => {
   try {
-    const orders = await ordersCollection
-      .find({ customerId: req.user.id })
-      .sort({ createdAt: -1 })
-      .toArray();
+    const filter = { customerId: req.user.id };
+    await expireStaleOrders(filter);
+    const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
     res.json(orders);
   } catch (error) {
     console.error("Error listing orders:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Single order, scoped to whoever's allowed to see it — the customer who
+// placed it, the owner of the device it's on, or admin. Meant to be
+// polled by the checkout confirmation screen so the customer can watch
+// pending -> dispensing -> completed happen live.
+app.get("/api/orders/:id", requireAuth, async (req, res) => {
+  try {
+    const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    if (req.user.role !== "admin" && order.customerId !== req.user.id) {
+      const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
+      if (!device || device.ownerId !== req.user.id) {
+        return res.status(403).json({ error: "Not your order" });
+      }
+    }
+
+    await expireStaleOrders({ _id: order._id });
+    const fresh = await ordersCollection.findOne({ _id: order._id });
+    res.json(fresh);
+  } catch (error) {
+    console.error("Error fetching order:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -697,6 +992,7 @@ app.get("/api/orders", requireAuth, requireRole(["owner", "admin"]), async (req,
       const deviceIds = ownDevices.map((d) => d._id.toString());
       filter = { deviceId: { $in: deviceIds } };
     }
+    await expireStaleOrders(filter);
     const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
     res.json(orders);
   } catch (error) {
@@ -723,10 +1019,18 @@ app.patch("/api/orders/:id/complete", requireAuth, requireRole(["owner", "admin"
     if (order.status === "completed") {
       return res.status(400).json({ error: "Order is already completed" });
     }
+    if (order.status === "failed") {
+      return res.status(400).json({ error: "This order already timed out and had its stock restored." });
+    }
+
+    const fullyDispensedItems = order.items.map((item, i) => ({
+      [`items.${i}.dispensedQty`]: item.qty,
+    }));
+    const dispensedFieldsSet = Object.assign({}, ...fullyDispensedItems);
 
     await ordersCollection.updateOne(
       { _id: order._id },
-      { $set: { status: "completed", completedAt: new Date() } }
+      { $set: { ...dispensedFieldsSet, status: "completed", completedAt: new Date() } }
     );
     res.json({ success: true });
   } catch (error) {
