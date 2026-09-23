@@ -402,8 +402,13 @@ app.patch("/api/devices/:id/wifi-status", requireAuth, requireRole(["owner", "ad
 });
 
 // ── Products ─────────────────────────────────────────────────────
+// Requires login (any role) — matches src/proxy.js on the Next.js side,
+// which already gates every /shop/* page behind a session. Without
+// requireAuth here, the full cross-tenant catalog (price, stock, images,
+// ownerId) was reachable by anyone, logged in or not.
 app.get(
   "/api/products",
+  requireAuth,
   async (req, res) => {
     const filter = req.query.deviceId ? { deviceId: req.query.deviceId } : {};
     const products = await productsCollection.find(filter).toArray();
@@ -411,9 +416,9 @@ app.get(
   }
 );
 
-// Single product lookup — public, same as the list endpoint, since this
-// backs the customer-facing product detail page.
-app.get("/api/products/:id", async (req, res) => {
+// Single product lookup — backs the customer-facing product detail page,
+// which itself sits behind a required session (src/proxy.js).
+app.get("/api/products/:id", requireAuth, async (req, res) => {
   try {
     const product = await productsCollection.findOne({ _id: new ObjectId(req.params.id) });
     if (!product) return res.status(404).json({ error: "Product not found" });
