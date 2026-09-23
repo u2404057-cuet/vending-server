@@ -410,8 +410,20 @@ app.get(
   "/api/products",
   requireAuth,
   async (req, res) => {
-    const filter = req.query.deviceId ? { deviceId: req.query.deviceId } : {};
-    const products = await productsCollection.find(filter).toArray();
+    const filter = {};
+    if (req.query.deviceId) {
+      // Comma-separated list of device IDs is accepted alongside a single
+      // ID (unchanged for existing callers) — lets a caller scope to
+      // several owned devices in one request instead of fetching
+      // everything and filtering client-side.
+      const deviceIds = req.query.deviceId.split(",").map((id) => id.trim()).filter(Boolean);
+      filter.deviceId = deviceIds.length > 1 ? { $in: deviceIds } : deviceIds[0];
+    }
+    // Dashboards only need counts/prices/stock, never the photo — and the
+    // base64-encoded `image` field is by far the largest part of each
+    // product document, so this is what actually makes those pages slow.
+    const projection = req.query.noImages === "true" ? { image: 0 } : {};
+    const products = await productsCollection.find(filter, { projection }).toArray();
     res.json(products);
   }
 );
