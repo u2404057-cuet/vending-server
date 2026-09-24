@@ -6,6 +6,7 @@ import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { client, db } from "./lib/db.js";
 import { auth } from "./lib/auth.js";
+import { initMqtt, publishOrderDispense, dispatchNextPendingOrder } from "./lib/mqtt.js";
 
 dotenv.config();
 const app = express();
@@ -105,6 +106,9 @@ async function failOrderInternal(order, reason) {
     { $set: { status: "failed", failedAt: new Date(), failureReason: reason, stockRestored: true } }
   );
 }
+
+// Initialize HiveMQ Cloud MQTT connection and subscribers
+initMqtt({ ordersCollection, devicesCollection, productsCollection, failOrderInternal });
 
 // Called at the top of every order-reading route, scoped to whatever that
 // route is already filtering by, so stale orders self-heal the moment
@@ -601,6 +605,8 @@ app.patch("/api/devices/by-token/:token/orders/:orderId/fail", async (req, res) 
 
     const reason = (req.body && req.body.reason) || "device_reported_failure";
     await failOrderInternal(order, reason);
+    // Pop and trigger next queued order in line
+    await dispatchNextPendingOrder(device);
     res.json({ success: true });
   } catch (error) {
     console.error("Error failing order from device:", error);
@@ -934,6 +940,19 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       stockRestored: false,
     };
     const result = await ordersCollection.insertOne(newOrder);
+
+    // Publish dispense command to HiveMQ Cloud for instant push to ESP32
+    try {
+      const device = await devicesCollection.findOne({ _id: new ObjectId(deviceId) });
+      if (device?.qrToken) {
+        publishOrderDispense(device.qrToken, {
+          orderId: result.insertedId.toString(),
+          items: newOrder.items.map((i) => ({ slotNumber: i.slotNumber, qty: i.qty })),
+        });
+      }
+    } catch (mqttErr) {
+      console.error("[mqtt] Error publishing order trigger:", mqttErr);
+    }
 
     res.status(201).json({ _id: result.insertedId, ...newOrder });
   } catch (error) {
