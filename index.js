@@ -2,8 +2,9 @@ import express, { json } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
-import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
+import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
+import { client, db } from "./lib/db.js";
 import { auth } from "./lib/auth.js";
 
 dotenv.config();
@@ -13,16 +14,6 @@ const port = process.env.PORT;
 app.use(json({ limit: "5mb" })); // product photos arrive as base64 data URLs — default 100kb limit would reject real images
 app.use(cors());
 
-const uri = process.env.MONGO_URI;
-
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
 async function run() {
   try {
     await client.connect();
@@ -30,13 +21,23 @@ async function run() {
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
     );
+
+    // Compound indexes for the queries hit most often. createIndex() is
+    // a no-op when the index already exists, so this is safe to run on
+    // every cold start without duplicating work.
+    await Promise.all([
+      devicesCollection.createIndex({ qrToken: 1 }, { unique: true }),
+      devicesCollection.createIndex({ ownerId: 1 }),
+      productsCollection.createIndex({ deviceId: 1, slotNumber: 1 }, { unique: true }),
+      ordersCollection.createIndex({ deviceId: 1, status: 1, createdAt: 1 }),
+      ordersCollection.createIndex({ customerId: 1, createdAt: -1 }),
+    ]);
+    console.log("Database indexes ensured.");
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
   }
 }
-run().catch(console.dir);
-
 async function requireAuth(req, res, next) {
   const result = await auth.api.getSession({
     headers: fromNodeHeaders(req.headers),
@@ -63,15 +64,17 @@ app.get("/api/whoami", requireAuth, (req, res) => {
   res.json(req.user);
 });
 
-const productsCollection = client.db("dispo").collection("products");
-const devicesCollection = client.db("dispo").collection("devices");
-const userCollection = client.db("dispo").collection("user");
-const sessionCollection = client.db("dispo").collection("session");
-const accountCollection = client.db("dispo").collection("account");
-const ordersCollection = client.db("dispo").collection("orders");
-const deviceLogsCollection = client.db("dispo").collection("device_logs");
+const productsCollection = db.collection("products");
+const devicesCollection = db.collection("devices");
+const userCollection = db.collection("user");
+const sessionCollection = db.collection("session");
+const accountCollection = db.collection("account");
+const ordersCollection = db.collection("orders");
+const deviceLogsCollection = db.collection("device_logs");
 const ALLOWED_ROLES = ["customer", "owner", "admin"];
 const ALLOWED_DEVICE_TYPES = ["coffee_machine", "vending_machine", "juice_machine"];
+
+run().catch(console.dir);
 
 // An order stuck this long without the board confirming completion is
 // treated as failed — either the machine never picked it up (still
@@ -788,10 +791,7 @@ app.post(
         createdAt: new Date(),
       };
 
-      const result = await client
-        .db("dispo")
-        .collection("products")
-        .insertOne(newProduct);
+      const result = await productsCollection.insertOne(newProduct);
 
       return res.status(201).json({
         _id: result.insertedId,
